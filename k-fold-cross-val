@@ -1,0 +1,644 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models, transforms, datasets
+from torch.utils.data import DataLoader, Subset
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support, \
+    precision_score, recall_score, f1_score
+from sklearn.model_selection import KFold, StratifiedKFold
+import argparse
+import random
+from collections import defaultdict
+import copy
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+random.seed(42)
+
+
+class EfficientNetWithLinearHead(nn.Module):
+
+    def __init__(self, num_classes):
+        super().__init__()
+        self.backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.backbone.fc = nn.Identity()
+
+        self.classifier = nn.Linear(2048, num_classes)
+        self.MLP = nn.Linear(2048,1280)
+
+        self.target_layer = self.backbone.layer4[-1]
+
+    def forward(self, x, text_feature=None):
+        features = self.backbone(x) 
+        output = self.classifier(features)
+        return self.MLP(features), output
+
+class StudentModel(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        self.stem = backbone.features[0:2]   
+        self.block2 = backbone.features[2:4] 
+        self.block3 = backbone.features[4:] 
+
+        self.avg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+        self.f_avg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+        self.classifier = nn.Linear(1280, num_classes)
+
+        self.adapter = nn.ModuleDict({
+            "adapter_1": nn.Sequential(
+                nn.Conv2d(16, 1280, kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(1280),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((7, 7))
+            ),
+            "adapter_2": nn.Sequential(
+                nn.Conv2d(40, 1280, kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(1280),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((7, 7))
+            )
+        })
+
+        self.adapter2 = nn.ModuleDict({
+            "adapter_3": nn.Sequential(nn.Linear(1280, 512, bias=False), nn.BatchNorm1d(512),
+                                       nn.ReLU(inplace=True), nn.Linear(512, num_classes, bias=False)),
+            "g_weight": nn.Sequential(nn.Linear(1280, 512, bias=False), nn.BatchNorm1d(512),
+                                      nn.ReLU(inplace=True), nn.Linear(512, 1, bias=False), nn.Sigmoid()),
+        })
+
+        # self.target_layer = self.block3[-1]
+
+    def forward(self, x):
+        f1 = self.stem(x)      # [B, 16, 112, 112] 
+        f2 = self.block2(f1)   # [B, 40, 28, 28] 
+        f3 = self.block3(f2)   # [B, 1280, 7, 7] 
+
+        x2a = self.adapter["adapter_1"](f1)
+        x3a = self.adapter["adapter_2"](f2)
+        avg_features = self.avg(f3)
+        logits = self.classifier(avg_features)
+        x4a = (0.1 * x2a + 0.3 * x3a + 0.6 * f3) / 1.0
+        fuse_features = self.f_avg(x4a)
+
+        ada_logits = self.adapter2["adapter_3"](fuse_features)
+
+        weight = self.adapter2["g_weight"](fuse_features)  # logits weight
+        total_logits = weight * logits + (1 - weight) * ada_logits
+
+        return fuse_features,total_logits
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.features = None
+
+        self.hooks = []
+        self.register_hooks()
+
+    def register_hooks(self):
+        def forward_hook(module, input, output):
+            self.features = output
+
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
+
+        self.hooks.append(self.target_layer.register_forward_hook(forward_hook))
+        self.hooks.append(self.target_layer.register_backward_hook(backward_hook))
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+
+    def generate_cam(self, input_image, target_class=None):
+        _, output = self.model(input_image)
+
+        if target_class is None:
+            target_class = output.argmax(dim=1)
+
+        self.model.zero_grad()
+        output[0, target_class].backward()
+
+        gradients = self.gradients
+        features = self.features
+        device = gradients.device
+        weights = torch.mean(gradients, dim=(2, 3))
+
+        cam = torch.zeros(features.shape[2:], dtype=torch.float32, device=device)
+        for i, w in enumerate(weights[0]):
+            cam += w * features[0, i, :, :]
+        cam = F.relu(cam)
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+
+        return cam.detach().cpu().numpy()
+
+
+def preprocess_image(image_path, target_size=(224, 224)):
+    image = Image.open(image_path).convert('RGB')
+    original_size = image.size
+
+    transform = transforms.Compose([
+        transforms.Resize(target_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    input_tensor = transform(image).unsqueeze(0)
+
+    return input_tensor, image, original_size
+
+
+def overlay_heatmap(image, heatmap, alpha=0.6):
+    heatmap_resized = cv2.resize(heatmap, (image.size[0], image.size[1]))
+    heatmap_colored = plt.cm.jet(heatmap_resized)[:, :, :3]
+    heatmap_colored = (heatmap_colored * 255).astype(np.uint8)
+
+    image_array = np.array(image)
+    overlay = image_array * (1 - alpha) + heatmap_colored * alpha
+    overlay = overlay.astype(np.uint8)
+
+    return Image.fromarray(overlay)
+
+
+def info_nce_loss(student_feats, teacher_feats, temperature=0.5):
+    batch_size = student_feats.size(0)
+
+    student_norm = F.normalize(student_feats, dim=1)
+    teacher_norm = F.normalize(teacher_feats, dim=1)
+
+    similarity_matrix = torch.matmul(student_norm, teacher_norm.t()) / temperature
+
+    labels = torch.arange(batch_size).to(student_feats.device)
+    loss = F.cross_entropy(similarity_matrix, labels)
+
+    return loss
+
+
+def train_single_fold(teacher_model, student_model, train_loader, val_loader, device, num_epochs=5, fold=0):
+
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                m.bias.data.fill_(0.01)
+        elif isinstance(m, nn.Conv2d):
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    teacher_model.classifier.apply(init_weights)
+    student_model.classifier.apply(init_weights)
+
+    optimizer = torch.optim.Adam(
+        list(student_model.parameters()) + list(teacher_model.parameters()),
+        lr=1e-4,
+        weight_decay=1e-4
+    )
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Initialize the learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=3,
+        threshold=0.01,
+        min_lr=1e-6,
+    )
+
+    best_val_acc = 0.0
+    best_model_state = None
+
+    print(f"\n=== 开始训练第 {fold + 1} 折 ===")
+
+    for epoch in range(num_epochs):
+        teacher_model.train()
+        student_model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            teacher_features, teacher_logits = teacher_model(images)
+            student_features, student_logits = student_model(images)
+
+            soft_targets = F.kl_div(
+                F.log_softmax(student_logits / 3, dim=1),
+                F.softmax(teacher_logits / 3, dim=1),
+                reduction="batchmean"
+            ) * (3 ** 2)
+
+            hard_targets = F.cross_entropy(student_logits, labels)
+
+            info_nce = info_nce_loss(student_features, teacher_features)
+            loss = 0.5 * soft_targets + 0.4 * hard_targets + 0.1 * info_nce
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            _, predicted = torch.max(student_logits.data, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+        student_model.eval()
+        val_correct = 0
+        val_total = 0
+        total_loss = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                _, outputs = student_model(images)
+                val_loss = criterion(outputs, labels)
+                total_loss += val_loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+        train_acc = 100 * train_correct / train_total
+        val_acc = 100 * val_correct / val_total
+        avg_loss = total_loss / len(val_loader)
+        scheduler.step(avg_loss)
+
+        print(f'Fold {fold + 1}, Epoch [{epoch + 1}/{num_epochs}]')
+        print(f'Train Loss: {train_loss / len(train_loader):.4f}, Train Acc: {train_acc:.2f}%')
+        print(f'Val Acc: {val_acc:.2f}%')
+        print('-' * 50)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = copy.deepcopy(student_model.state_dict())
+            print(f'Fold {fold + 1} - Best model updated with validation accuracy: {val_acc:.2f}%')
+
+    if best_model_state is not None:
+        student_model.load_state_dict(best_model_state)
+
+    return student_model, best_val_acc
+
+
+def evaluate_model(model, test_loader, device, class_names, test_dataset=None, fold=None):
+    model.eval()
+    all_predictions = []
+    all_labels = []
+    all_file_paths = []
+
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(test_loader):
+            images, labels = images.to(device), labels.to(device)
+            _, outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            if test_dataset is not None:
+                start_idx = batch_idx * test_loader.batch_size
+                end_idx = min(start_idx + test_loader.batch_size, len(test_dataset))
+                for idx in range(start_idx, end_idx):
+                    if hasattr(test_dataset, 'samples'):
+                        file_path = test_dataset.samples[idx][0]
+                    else:
+                        # 对于Subset，需要通过indices获取原始dataset的样本
+                        original_idx = test_dataset.indices[idx]
+                        file_path = test_dataset.dataset.samples[original_idx][0]
+                    all_file_paths.append(file_path)
+
+    accuracy = accuracy_score(all_labels, all_predictions)
+
+    precision_macro = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
+    recall_macro = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
+    f1_macro = f1_score(all_labels, all_predictions, average='macro', zero_division=0)
+
+    precision_weighted = precision_score(all_labels, all_predictions, average='weighted', zero_division=0)
+    recall_weighted = recall_score(all_labels, all_predictions, average='weighted', zero_division=0)
+    f1_weighted = f1_score(all_labels, all_predictions, average='weighted', zero_division=0)
+
+    precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(
+        all_labels, all_predictions, average=None, zero_division=0
+    )
+
+    report = classification_report(all_labels, all_predictions,
+                                   target_names=class_names, digits=4, zero_division=0)
+
+    cm = confusion_matrix(all_labels, all_predictions)
+
+    metrics = {
+        'accuracy': accuracy,
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'f1_macro': f1_macro,
+        'precision_weighted': precision_weighted,
+        'recall_weighted': recall_weighted,
+        'f1_weighted': f1_weighted,
+        'precision_per_class': precision_per_class,
+        'recall_per_class': recall_per_class,
+        'f1_per_class': f1_per_class,
+        'support_per_class': support_per_class,
+    }
+
+    fold_str = f"第 {fold + 1} 折" if fold is not None else "测试集"
+    print(f"\n{fold_str} :")
+    print(f"(Accuracy): {accuracy * 100:.2f}%")
+    print(f"(Precision) - Macro: {precision_macro * 100:.2f}%")
+    print(f"(Recall) - Macro: {recall_macro * 100:.2f}%")
+    print(f"F1- Macro: {f1_macro * 100:.2f}%")
+    print(f"(Precision) - Weighted: {precision_weighted * 100:.2f}%")
+    print(f"(Recall) - Weighted: {recall_weighted * 100:.2f}%")
+    print(f"F1- Weighted: {f1_weighted * 100:.2f}%")
+
+
+def get_stratified_kfold_splits(dataset, k=5, random_state=42):
+    if hasattr(dataset, 'targets'):
+        labels = dataset.targets
+    else:
+        labels = [dataset[i][1] for i in range(len(dataset))]
+
+    labels = np.array(labels)
+    indices = np.arange(len(dataset))
+
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+
+    fold_splits = []
+    for train_idx, val_idx in skf.split(indices, labels):
+        fold_splits.append((train_idx, val_idx))
+
+    return fold_splits
+
+
+def visualize_gradcam(model, image_path, class_names, device, save_path=None):
+
+    grad_cam = GradCAM(model, model.target_layer)
+
+    input_tensor, original_image, original_size = preprocess_image(image_path)
+    input_tensor = input_tensor.to(device)
+
+    model.eval()
+    with torch.no_grad():
+        _, output = model(input_tensor)
+        predicted_class = output.argmax(dim=1).item()
+        confidence = F.softmax(output, dim=1)[0, predicted_class].item()
+
+    heatmap = grad_cam.generate_cam(input_tensor, predicted_class)
+
+    overlay_image = overlay_heatmap(original_image, heatmap)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(original_image)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+
+    axes[1].imshow(heatmap, cmap='jet')
+    axes[1].set_title('Grad-CAM')
+    axes[1].axis('off')
+
+    axes[2].imshow(overlay_image)
+    axes[2].set_title(f'Predicted: {class_names[predicted_class]} ({confidence:.3f})')
+    axes[2].axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"{save_path}")
+
+    plt.show()
+
+    grad_cam.remove_hooks()
+
+    return predicted_class, confidence, heatmap
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='EfficientNet-B0 with K-Fold Cross Validation and Grad-CAM visualization')
+    parser.add_argument('--data_root', default='data/Dispensing',
+                        help='数据根目录')
+    parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
+    parser.add_argument('--num_epochs', type=int, default=50, help='训练轮数')
+    parser.add_argument('--k_folds', type=int, default=5, help='K折交叉验证的折数')
+    parser.add_argument('--visualize_samples', type=int, default=5, help='可视化样本数量')
+    parser.add_argument('--use_combined_data', default=True,
+                        help='是否合并train和val数据进行K折交叉验证')
+
+    args = parser.parse_args()
+
+    set_seed(42)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    train_dir = os.path.join(args.data_root, 'train')
+    val_dir = os.path.join(args.data_root, 'val')
+    test_dir = os.path.join(args.data_root, 'test')
+    if args.use_combined_data:
+
+        train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+        val_dataset = datasets.ImageFolder(root=val_dir, transform=transform)
+        combined_samples = train_dataset.samples + val_dataset.samples
+        combined_targets = train_dataset.targets + val_dataset.targets
+
+        combined_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+        combined_dataset.samples = combined_samples
+        combined_dataset.targets = combined_targets
+
+        fold_splits = get_stratified_kfold_splits(combined_dataset, k=args.k_folds)
+
+        test_dataset = datasets.ImageFolder(root=test_dir, transform=transform)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                                 shuffle=False, num_workers=4)
+    else:
+        print("仅在训练数据上进行K折交叉验证")
+
+        train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+        fold_splits = get_stratified_kfold_splits(train_dataset, k=args.k_folds)
+        val_dataset = datasets.ImageFolder(root=val_dir, transform=transform)
+        test_dataset = datasets.ImageFolder(root=test_dir, transform=transform)
+
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                                 shuffle=False, num_workers=4)
+
+    num_classes = len(train_dataset.classes)
+    class_names = train_dataset.classes
+
+    print(f"{num_classes}")
+    print(f"{class_names}")
+    print(f"K: {args.k_folds}")
+    if args.use_combined_data:
+        print(f"dataset size: {len(combined_dataset)}")
+    else:
+        print(f"train: {len(train_dataset)}")
+        print(f"val: {len(val_dataset)}")
+    print(f"test: {len(test_dataset)}")
+
+    fold_accuracies = []
+    fold_models = []
+    all_fold_results = []
+    for fold in range(args.k_folds):
+        print(f"\n{'=' * 60}")
+        print(f"第 {fold + 1}/{args.k_folds} 折交叉验证")
+        print(f"{'=' * 60}")
+
+        if args.use_combined_data:
+            train_indices, fold_val_indices = fold_splits[fold]
+            fold_train_dataset = Subset(combined_dataset, train_indices)
+            fold_val_dataset = Subset(combined_dataset, fold_val_indices)
+        else:
+            train_indices, fold_val_indices = fold_splits[fold]
+
+            fold_train_dataset = Subset(train_dataset, train_indices)
+            fold_val_dataset = Subset(train_dataset, fold_val_indices)
+
+        fold_train_loader = DataLoader(fold_train_dataset, batch_size=args.batch_size,
+                                       shuffle=True, num_workers=4)
+        fold_val_loader = DataLoader(fold_val_dataset, batch_size=args.batch_size,
+                                     shuffle=False, num_workers=4)
+
+        print(f" {fold + 1} train: {len(fold_train_dataset)}")
+        print(f"{fold + 1} val: {len(fold_val_dataset)}")
+
+        teacher_model = EfficientNetWithLinearHead(num_classes).to(device)
+        student_model = StudentModel(num_classes).to(device)
+
+        fold_model, fold_val_acc = train_single_fold(
+            teacher_model, student_model,
+            fold_train_loader, fold_val_loader,
+            device, args.num_epochs, fold
+        )
+
+        fold_metrics, fold_predictions, fold_labels, fold_cm, fold_error_files = evaluate_model(
+            fold_model, fold_val_loader, device, class_names, fold_val_dataset, fold=fold
+        )
+
+        fold_accuracies.append(fold_metrics['accuracy'])
+        fold_models.append(copy.deepcopy(fold_model.state_dict()))
+
+        fold_result = {
+            'fold': fold + 1,
+            'metrics': fold_metrics,
+            'predictions': fold_predictions,
+            'labels': fold_labels,
+            'confusion_matrix': fold_cm,
+            'error_files': fold_error_files
+        }
+        all_fold_results.append(fold_result)
+
+        print(f"第 {fold + 1} 折验证准确率: {fold_metrics['accuracy'] * 100:.2f}%")
+
+        torch.save(fold_model.state_dict(), f'best_efficientnet_fold_{fold + 1}.pth')
+
+    mean_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+
+    all_precision_macro = [result['metrics']['precision_macro'] for result in all_fold_results]
+    all_recall_macro = [result['metrics']['recall_macro'] for result in all_fold_results]
+    all_f1_macro = [result['metrics']['f1_macro'] for result in all_fold_results]
+    all_precision_weighted = [result['metrics']['precision_weighted'] for result in all_fold_results]
+    all_recall_weighted = [result['metrics']['recall_weighted'] for result in all_fold_results]
+    all_f1_weighted = [result['metrics']['f1_weighted'] for result in all_fold_results]
+
+    mean_precision_macro = np.mean(all_precision_macro)
+    std_precision_macro = np.std(all_precision_macro)
+    mean_recall_macro = np.mean(all_recall_macro)
+    std_recall_macro = np.std(all_recall_macro)
+    mean_f1_macro = np.mean(all_f1_macro)
+    std_f1_macro = np.std(all_f1_macro)
+    mean_precision_weighted = np.mean(all_precision_weighted)
+    std_precision_weighted = np.std(all_precision_weighted)
+    mean_recall_weighted = np.mean(all_recall_weighted)
+    std_recall_weighted = np.std(all_recall_weighted)
+    mean_f1_weighted = np.mean(all_f1_weighted)
+    std_f1_weighted = np.std(all_f1_weighted)
+
+    print(f"\n{'=' * 60}")
+    print(f"{'=' * 60}")
+    print(f"{[f'{acc * 100:.2f}%' for acc in fold_accuracies]}")
+    print(f"{mean_accuracy * 100:.2f}% ± {std_accuracy * 100:.2f}%")
+    print(f"(Macro): {mean_precision_macro * 100:.2f}% ± {std_precision_macro * 100:.2f}%")
+    print(f"(Macro): {mean_recall_macro * 100:.2f}% ± {std_recall_macro * 100:.2f}%")
+    print(f"F1(Macro): {mean_f1_macro * 100:.2f}% ± {std_f1_macro * 100:.2f}%")
+    print(f"(Weighted): {mean_precision_weighted * 100:.2f}% ± {std_precision_weighted * 100:.2f}%")
+    print(f"(Weighted): {mean_recall_weighted * 100:.2f}% ± {std_recall_weighted * 100:.2f}%")
+    print(f"F1(Weighted): {mean_f1_weighted * 100:.2f}% ± {std_f1_weighted * 100:.2f}%")
+    print(f"{max(fold_accuracies) * 100:.2f}%")
+    print(f" {min(fold_accuracies) * 100:.2f}%")
+
+    best_fold_idx = np.argmax(fold_accuracies)
+    best_model = StudentModel(num_classes).to(device)
+    best_model.load_state_dict(fold_models[best_fold_idx])
+
+    print(f"\n {best_fold_idx + 1} 折的模型作为最佳模型进行最终测试")
+
+    print(f"\n{'=' * 60}")
+    print(f"最佳模型在测试集上的表现")
+    print(f"{'=' * 60}")
+
+    test_metrics, test_predictions, test_labels, test_cm, test_error_files = evaluate_model(
+        best_model, test_loader, device, class_names, test_dataset
+    )
+
+    if not args.use_combined_data:
+        print(f"\n{'=' * 60}")
+        print(f"{'=' * 60}")
+
+        val_metrics, val_predictions, val_labels, val_cm, val_error_files = evaluate_model(
+            best_model, val_loader, device, class_names, val_dataset
+        )
+    test_image_paths = []
+    for root, dirs, files in os.walk(test_dir):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.bmp', '.jpeg')):
+                test_image_paths.append(os.path.join(root, file))
+
+    random.seed(42)  
+    selected_images = random.sample(test_image_paths, min(args.visualize_samples, len(test_image_paths)))
+
+    for i, image_path in enumerate(selected_images):
+        print(f"\n可视化样本 {i + 1}/{len(selected_images)}: {os.path.basename(image_path)}")
+        path_parts = image_path.replace('/', '\\').split('\\')
+        class_folder = path_parts[-2]
+        try:
+            true_label = int(class_folder)
+        except ValueError:
+            true_label = 0  # 默认值
+            for class_idx, class_name in enumerate(class_names):
+                if class_name == class_folder:
+                    true_label = class_idx
+                    break
+
+        predicted_class, confidence, heatmap = visualize_gradcam(
+            best_model, image_path, class_names, device,
+            save_path=f'gradcam_sample_{i + 1}.png'
+        )
+
+
+if __name__ == '__main__':
+    main()
