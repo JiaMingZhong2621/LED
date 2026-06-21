@@ -1,13 +1,12 @@
 # Lightweight Dual-Path Network with Dynamic Distillation for Industrial LED Defect Recognition
 
 <p align="center">
-  <img src="(model.png" width="900">
+  <img src="model.png" width="900">
 </p>
 
 <p align="center">
 Overview of the proposed Dynamic Dual-Path Classification and Dual-Level Distillation framework.
 </p>
----
 
 ## Introduction
 
