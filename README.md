@@ -1,17 +1,12 @@
-# LED-DDNet: A Lightweight Dual-Path Approach for LED Defect Recognition via Dynamic Distillation
-![Framework](model.png)
-The manuscript has been submitted to The Visual Computer.
-
 # Lightweight Dual-Path Network with Dynamic Distillation for Industrial LED Defect Recognition
 
 <p align="center">
-  <img src="figures/framework.png" width="900">
+  <img src="(model.png" width="900">
 </p>
 
 <p align="center">
 Overview of the proposed Dynamic Dual-Path Classification and Dual-Level Distillation framework.
 </p>
-
 ---
 
 ## Introduction
@@ -31,67 +26,6 @@ To address these issues, we propose a **Lightweight Dual-Path Network with Dynam
 
 The proposed framework achieves high recognition accuracy while maintaining lightweight computational complexity.
 
----
-
-## Network Architecture
-
-### Dynamic Dual-Path Classifier (DDPC)
-
-The DDPC module contains two complementary branches:
-
-1. Global classification branch
-2. Adaptive hierarchical fusion branch
-
-The fusion branch aggregates multi-level features extracted from EfficientNet-B0 to enhance fine-grained defect discrimination.
-
-### Dynamic Logits Fusion (DLF)
-
-Instead of using fixed fusion weights, a lightweight gating network dynamically predicts a sample-dependent fusion coefficient:
-
-[
-\hat{y} = \beta y_g + (1-\beta)y_a
-]
-
-where
-
-* (y_g) denotes logits from the global branch;
-* (y_a) denotes logits from the adaptive fusion branch;
-* (\beta) is generated dynamically for each sample.
-
-### Dual-Level Distillation (DLD)
-
-Knowledge is transferred from a ResNet50 teacher network to the EfficientNet-B0 student through:
-
-#### Logit-Level Distillation
-
-KL divergence is employed to transfer class-relation knowledge:
-
-[
-\mathcal{L}_{KLD}
-]
-
-#### Feature-Level Distillation
-
-InfoNCE loss aligns student and teacher representations:
-
-[
-\mathcal{L}_{NCE}
-]
-
-The overall objective is:
-
-[
-\mathcal{L}
-===========
-
-\alpha \mathcal{L}*{KLD}
-+
-\beta \mathcal{L}*{CE}
-+
-\gamma \mathcal{L}_{NCE}
-]
-
----
 
 ## Dataset Structure
 
@@ -178,33 +112,6 @@ Reported metrics include:
 
 ---
 
-## Grad-CAM Visualization
-
-The repository supports Grad-CAM visualization for model interpretability.
-
-Example outputs:
-
-```text
-gradcam_sample_1.png
-gradcam_sample_2.png
-...
-```
-
-These visualizations highlight the defect regions used by the model for decision making.
-
----
-
-## Complexity
-
-| Model           | Params (M) | FLOPs (G) |
-| --------------- | ---------- | --------- |
-| EfficientNet-B0 | 4.01       | 0.41      |
-| Proposed Model  | 5.40       | 0.80      |
-
-The proposed framework maintains lightweight complexity while significantly improving defect recognition performance.
-
----
-
 ## Citation
 
 If you find this repository useful, please consider citing:
@@ -230,9 +137,4 @@ submitted to *The Visual Computer*.
 
 The code is released to improve transparency, reproducibility, and future research on industrial defect recognition.
 
----
-
-## License
-
-This project is released under the MIT License.
 
