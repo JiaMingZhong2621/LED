@@ -7,7 +7,6 @@
 <p align="center">
 Overview of the proposed Dynamic Dual-Path Classification and Dual-Level Distillation framework.
 </p>
----
 
 ## Introduction
 
