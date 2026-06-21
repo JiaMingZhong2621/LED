@@ -7,7 +7,7 @@
 <p align="center">
 Overview of the proposed Dynamic Dual-Path Classification and Dual-Level Distillation framework.
 </p>
-
+--
 ## Introduction
 
 Industrial LED defect recognition plays a critical role in intelligent manufacturing systems. However, practical deployment faces several challenges, including:
